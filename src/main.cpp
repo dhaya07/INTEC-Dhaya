@@ -19,6 +19,17 @@
 #define W5500_RST   13
 #define W5500_INT   4
 
+// ── TFT Display Pins ─────────────────────────────────
+#define TFT_MOSI       23
+#define TFT_MISO       19
+#define TFT_SCLK       18
+#define TFT_CS         5
+#define TFT_DC         4
+#define TFT_RST        -1
+#define MCP_CS         27
+#define TFT_LED_PIN    1
+#define TFT_RESET_PIN  9
+
 // ── RS485 Pins ───────────────────────────────────────
 #define S0          25
 #define S1          26
@@ -81,6 +92,9 @@
 
 
 #include <SPI.h>
+#include "Ucglib.h"
+#include <Adafruit_MCP23X17.h>
+#include "logo565.h"
 #include <Ethernet.h>
 
 #include <ArduinoJson.h>
@@ -137,6 +151,33 @@ MQTTClient wifiClientPubSub(2048, 2048);           // MQTT client over WiFi (2KB
 EthernetClient ethClient;                          // W5500 TCP client for MQTT
 MQTTClient ethernetClientPubSub(2048, 2048);       // MQTT client over Ethernet (2KB send/recv buffer)
 byte mac[6];                                       // MAC address bytes parsed from ethMacAddr string
+
+// ══════════════════════════════════════════════════════
+//  TFT DISPLAY
+// ══════════════════════════════════════════════════════
+Adafruit_MCP23X17 mcp;
+Ucglib_ILI9341_18x240x320_HWSPI ucg(TFT_DC, TFT_CS, TFT_RST);
+
+enum DisplayState {
+  LOGO_PAGE,
+  SENSOR_PAGE
+};
+
+struct DisplaySensorData {
+  float frequency;
+  float vlnAvg;
+  float vllAvg;
+  bool dataValid;
+};
+
+DisplayState currentDisplayState = LOGO_PAGE;
+DisplaySensorData displaySensorData = {0.0f, 0.0f, 0.0f, false};
+unsigned long displayStateChangeTime = 0;
+const unsigned long LOGO_DURATION = 2000;
+const unsigned long SENSOR_DURATION = 12000;
+bool displayReady = false;
+bool displayPageNeedsRedraw = true;
+int bottleAnimFrame = 0;
 
 // ══════════════════════════════════════════════════════
 //  CONFIG CHAR ARRAYS (saved/loaded from LittleFS)
@@ -342,6 +383,340 @@ bool configResetPressed();
 // -- Loopback Test --
 void testLoopbackMQTT();
 
+// -- TFT Display --
+void initDisplay();
+void updateDisplayState();
+void updateDisplaySensorValue(uint8_t slaveId, uint16_t address, float value);
+void readDisplaySensors();
+void drawRGB565Image(int x, int y, int w, int h, int scaled_w, int scaled_h, const uint16_t *img);
+void drawBottle(int x, int y);
+void drawConveyor();
+void displayLogoPage();
+void displaySensorPage();
+
+
+// ══════════════════════════════════════════════════════
+//  TFT DISPLAY FUNCTIONS
+// ══════════════════════════════════════════════════════
+
+void updateDisplaySensorValue(uint8_t slaveId, uint16_t address, float value) {
+  (void)slaveId;
+
+  if (address == 3037) {
+    displaySensorData.frequency = value;
+    displaySensorData.dataValid = true;
+    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
+  } else if (address == 3027) {
+    displaySensorData.vlnAvg = value;
+    displaySensorData.dataValid = true;
+    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
+  } else if (address == 3023) {
+    displaySensorData.vllAvg = value;
+    displaySensorData.dataValid = true;
+    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
+  }
+}
+
+void readDisplaySensors() {
+  if (requestInProgress || strcmp(protocolType, "rs485") != 0) return;
+
+  const uint8_t slaveId = 52;
+  uint16_t regs[2] = {0, 0};
+  bool bools[2] = {false, false};
+
+  requestInProgress = true;
+
+  if (readModbusRTUDirect(slaveId, 3, 3037, 2, regs, bools)) {
+    updateDisplaySensorValue(slaveId, 3037, combineToFloat(regs[0], regs[1]));
+  }
+  delay(50);
+
+  if (readModbusRTUDirect(slaveId, 3, 3027, 2, regs, bools)) {
+    updateDisplaySensorValue(slaveId, 3027, combineToFloat(regs[0], regs[1]));
+  }
+  delay(50);
+
+  if (readModbusRTUDirect(slaveId, 3, 3023, 2, regs, bools)) {
+    updateDisplaySensorValue(slaveId, 3023, combineToFloat(regs[0], regs[1]));
+  }
+
+  requestInProgress = false;
+}
+
+void drawRGB565Image(int x, int y, int w, int h, int scaled_w, int scaled_h, const uint16_t *img) {
+  if (!displayReady) return;
+
+  float scale_x = (float)w / scaled_w;
+  float scale_y = (float)h / scaled_h;
+
+  for (int j = 0; j < scaled_h; j++) {
+    for (int i = 0; i < scaled_w; i++) {
+      int src_i = (int)(i * scale_x);
+      int src_j = (int)(j * scale_y);
+
+      if (src_i >= w) src_i = w - 1;
+      if (src_j >= h) src_j = h - 1;
+
+      uint16_t color = pgm_read_word(&img[src_j * w + src_i]);
+      uint8_t r = ((color >> 11) & 0x1F) << 3;
+      uint8_t g = ((color >> 5) & 0x3F) << 2;
+      uint8_t b = (color & 0x1F) << 3;
+
+      ucg.setColor(r, g, b);
+      ucg.drawPixel(x + i, y + j);
+    }
+  }
+}
+
+void drawBottle(int x, int y) {
+  if (!displayReady) return;
+
+  ucg.setColor(30, 120, 255);
+  ucg.drawFrame(x, y + 5, 12, 22);
+
+  ucg.setColor(120, 180, 255);
+  ucg.drawBox(x + 2, y + 7, 8, 16);
+
+  ucg.setColor(180, 220, 255);
+  ucg.drawBox(x + 4, y + 2, 4, 6);
+
+  ucg.setColor(220, 220, 220);
+  ucg.drawBox(x + 3, y, 6, 2);
+
+  ucg.setColor(255, 255, 255);
+  ucg.drawVLine(x + 3, y + 8, 12);
+}
+
+void drawConveyor() {
+  if (!displayReady) return;
+
+  ucg.setColor(245, 245, 245);
+  ucg.drawBox(0, 188, 320, 52);
+
+  ucg.setColor(50, 50, 50);
+  ucg.drawBox(0, 214, 320, 16);
+
+  ucg.setColor(120, 120, 120);
+  ucg.drawLine(0, 214, 320, 214);
+
+  for (int i = 0; i < 320; i += 22) {
+    ucg.setColor(80, 80, 80);
+    ucg.drawDisc(i + 10, 222, 3, UCG_DRAW_ALL);
+  }
+
+  for (int i = 0; i < 10; i++) {
+    int x = (i * 34) - bottleAnimFrame;
+    if (x < -20) x += 360;
+    drawBottle(x, 188);
+  }
+
+  ucg.setColor(0, 120, 255);
+  ucg.drawLine(286, 198, 306, 198);
+  ucg.drawLine(306, 198, 300, 192);
+  ucg.drawLine(306, 198, 300, 204);
+}
+
+void displayLogoPage() {
+  if (!displayReady) return;
+
+  ucg.setColor(255, 255, 255);
+  ucg.drawBox(0, 0, 320, 240);
+
+  int scaled_width = (IMAGE_WIDTH * 60) / 100;
+  int scaled_height = (IMAGE_HEIGHT * 60) / 100;
+  int img_x = (320 - scaled_width) / 2;
+  int img_y = 15;
+
+  drawRGB565Image(img_x, img_y, IMAGE_WIDTH, IMAGE_HEIGHT, scaled_width, scaled_height, logo565);
+
+  ucg.setColor(0, 0, 0);
+  ucg.setFont(ucg_font_ncenR14_hr);
+  ucg.setPrintPos(135, img_y + scaled_height + 28);
+  ucg.print("BIT");
+
+  ucg.setFont(ucg_font_ncenR18_hr);
+  ucg.setPrintPos(18, img_y + scaled_height + 63);
+  ucg.print("Industrial IoT Gateway");
+}
+
+void displaySensorPage() {
+  if (!displayReady) return;
+
+  ucg.setColor(245, 245, 245);
+  ucg.drawBox(0, 0, 320, 240);
+
+  ucg.setColor(15, 40, 90);
+  ucg.drawBox(0, 0, 320, 32);
+  ucg.setColor(0, 140, 255);
+  ucg.drawLine(0, 31, 320, 31);
+
+  ucg.setColor(255, 255, 255);
+  ucg.setFont(ucg_font_ncenR14_hr);
+  ucg.setPrintPos(15, 22);
+  ucg.print("STATION DATA");
+
+  ucg.setColor(0, 220, 0);
+  ucg.drawCircle(255, 15, 2, UCG_DRAW_ALL);
+  ucg.drawCircle(255, 15, 6, UCG_DRAW_UPPER_RIGHT);
+  ucg.drawCircle(255, 15, 6, UCG_DRAW_UPPER_LEFT);
+  ucg.drawCircle(255, 15, 10, UCG_DRAW_UPPER_RIGHT);
+  ucg.drawCircle(255, 15, 10, UCG_DRAW_UPPER_LEFT);
+
+  ucg.setColor(120, 120, 120);
+  ucg.drawBox(285, 18, 4, 6);
+  ucg.drawBox(292, 14, 4, 10);
+  ucg.drawBox(299, 10, 4, 14);
+  ucg.drawBox(306, 6, 4, 18);
+
+  ucg.setColor(0, 180, 70);
+  ucg.drawRFrame(8, 42, 118, 95, 4);
+  ucg.setColor(0, 255, 0);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(18, 58);
+  ucg.print("BOTTLE FEEDER");
+  ucg.setPrintPos(40, 75);
+  ucg.print("SYSTEM");
+
+  ucg.setColor(0, 180, 0);
+  ucg.setFont(ucg_font_logisoso20_tf);
+  ucg.setPrintPos(28, 112);
+  ucg.print("LIVE");
+
+  ucg.setColor(0, 255, 80);
+  ucg.drawCircle(68, 118, 14, UCG_DRAW_ALL);
+  ucg.setColor(0, 180, 60);
+  ucg.drawDisc(68, 118, 8, UCG_DRAW_ALL);
+
+  ucg.setColor(0, 110, 255);
+  ucg.drawRFrame(135, 42, 85, 70, 4);
+  ucg.setColor(20, 20, 20);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(145, 58);
+  ucg.print("FREQUENCY");
+
+  char freq[10];
+  dtostrf(displaySensorData.frequency, 4, 1, freq);
+  ucg.setFont(ucg_font_logisoso20_tf);
+  ucg.setPrintPos(148, 95);
+  ucg.print(freq);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(185, 105);
+  ucg.print("Hz");
+
+  ucg.setColor(0, 110, 255);
+  ucg.drawRFrame(228, 42, 85, 70, 4);
+  ucg.setColor(20, 20, 20);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(248, 58);
+  ucg.print("VLN AVG");
+
+  char vln[12];
+  dtostrf(displaySensorData.vlnAvg, 4, 1, vln);
+  ucg.setFont(ucg_font_logisoso20_tf);
+  ucg.setPrintPos(236, 95);
+  ucg.print(vln);
+
+  ucg.setColor(0, 110, 255);
+  ucg.drawRFrame(135, 122, 178, 58, 4);
+  ucg.setColor(20, 20, 20);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(145, 140);
+  ucg.print("VLL AVG");
+
+  char vll[12];
+  dtostrf(displaySensorData.vllAvg, 4, 1, vll);
+  ucg.setFont(ucg_font_logisoso24_tf);
+  ucg.setPrintPos(188, 165);
+  ucg.print(vll);
+  ucg.setColor(0, 120, 255);
+  ucg.setFont(ucg_font_6x13_tf);
+  ucg.setPrintPos(276, 165);
+  ucg.print("V");
+
+  drawConveyor();
+}
+
+void updateDisplayState() {
+  if (!displayReady) return;
+
+  unsigned long currentTime = millis();
+  unsigned long currentDuration = (currentDisplayState == LOGO_PAGE) ? LOGO_DURATION : SENSOR_DURATION;
+
+  if (currentTime - displayStateChangeTime >= currentDuration) {
+    currentDisplayState = (currentDisplayState == LOGO_PAGE) ? SENSOR_PAGE : LOGO_PAGE;
+    if (currentDisplayState == SENSOR_PAGE) {
+      readDisplaySensors();
+    }
+    displayStateChangeTime = currentTime;
+    displayPageNeedsRedraw = true;
+  }
+
+  if (displayPageNeedsRedraw) {
+    if (currentDisplayState == LOGO_PAGE) {
+      displayLogoPage();
+    } else {
+      displaySensorPage();
+      bottleAnimFrame = 0;
+    }
+    displayPageNeedsRedraw = false;
+  } else if (currentDisplayState == SENSOR_PAGE) {
+    static unsigned long lastAnimTime = 0;
+    static unsigned long lastDisplayReadTime = 0;
+
+    if (millis() - lastDisplayReadTime >= 1000) {
+      lastDisplayReadTime = millis();
+      readDisplaySensors();
+    }
+
+    if (millis() - lastAnimTime > 150) {
+      lastAnimTime = millis();
+      bottleAnimFrame++;
+      if (bottleAnimFrame > 340) bottleAnimFrame = 0;
+      drawConveyor();
+    }
+  }
+}
+
+void initDisplay() {
+  pinMode(MCP_CS, OUTPUT);
+  digitalWrite(MCP_CS, HIGH);
+
+  pinMode(W5500_CS, OUTPUT);
+  digitalWrite(W5500_CS, HIGH);
+
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+
+  SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+
+  if (!mcp.begin_SPI(MCP_CS)) {
+    Serial.println("[DISPLAY] MCP23S17 Failed");
+    displayReady = false;
+    return;
+  }
+
+  mcp.pinMode(TFT_LED_PIN, OUTPUT);
+  mcp.pinMode(TFT_RESET_PIN, OUTPUT);
+  mcp.digitalWrite(TFT_LED_PIN, HIGH);
+
+  mcp.digitalWrite(TFT_RESET_PIN, LOW);
+  delay(50);
+  mcp.digitalWrite(TFT_RESET_PIN, HIGH);
+  delay(200);
+
+  ucg.begin(UCG_FONT_MODE_TRANSPARENT);
+  ucg.setRotate90();
+  ucg.clearScreen();
+
+  displayReady = true;
+  currentDisplayState = LOGO_PAGE;
+  displayStateChangeTime = millis();
+  displayPageNeedsRedraw = true;
+
+  Serial.println("[DISPLAY] TFT ready");
+  displayLogoPage();
+  displayPageNeedsRedraw = false;
+}
 
 // ══════════════════════════════════════════════════════
 //  UTILITY FUNCTIONS
@@ -3378,7 +3753,11 @@ void readprocessModbusRequest(uint8_t slaveId, uint16_t functionCode, uint16_t a
   callbackResult = true;  // direct read succeeded — data is valid
 
   char msg[512];
-  if (dataType == "float" && count == 2) { float v = combineToFloat(buffers[0], buffers[1]); snprintf(msg, sizeof(msg), "%f", v); }
+  if (dataType == "float" && count == 2) {
+    float v = combineToFloat(buffers[0], buffers[1]);
+    updateDisplaySensorValue(slaveId, address, v);
+    snprintf(msg, sizeof(msg), "%f", v);
+  }
   else if (dataType == "int16" && count == 1) { snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]); }
   else if (dataType == "uint16" && count == 1) { snprintf(msg, sizeof(msg), "%u", buffers[0]); }
   else if (dataType == "int32" && count == 2) { snprintf(msg, sizeof(msg), "%ld", (long)combineToInt32(buffers[0], buffers[1])); }
@@ -3456,7 +3835,11 @@ void readprocessModbusRequestTCPWiFi(const IPAddress& slaveIP, uint16_t function
   }
 
   char msg[50];
-  if (dataType == "float" && count == 2) snprintf(msg, sizeof(msg), "%f", combineToFloat(buffers[0], buffers[1]));
+  if (dataType == "float" && count == 2) {
+    float v = combineToFloat(buffers[0], buffers[1]);
+    updateDisplaySensorValue(0, address, v);
+    snprintf(msg, sizeof(msg), "%f", v);
+  }
   else if (dataType == "int16" && count == 1) snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]);
   else if (dataType == "uint16" && count == 1) snprintf(msg, sizeof(msg), "%u", buffers[0]);
   else if (dataType == "int32" && count == 2) snprintf(msg, sizeof(msg), "%ld", (long)combineToInt32(buffers[0], buffers[1]));
@@ -3514,7 +3897,11 @@ void readprocessModbusRequestTCPEthernet(const IPAddress& slaveIP, uint16_t func
   }
 
   char msg[50];
-  if (dataType == "float" && count == 2) snprintf(msg, sizeof(msg), "%f", combineToFloat(buffers[0], buffers[1]));
+  if (dataType == "float" && count == 2) {
+    float v = combineToFloat(buffers[0], buffers[1]);
+    updateDisplaySensorValue(0, address, v);
+    snprintf(msg, sizeof(msg), "%f", v);
+  }
   else if (dataType == "int16" && count == 1) snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]);
   else if (dataType == "uint16" && count == 1) snprintf(msg, sizeof(msg), "%u", buffers[0]);
   else if (dataType == "int32" && count == 2) snprintf(msg, sizeof(msg), "%ld", (long)combineToInt32(buffers[0], buffers[1]));
@@ -3684,6 +4071,8 @@ void setup() {
     delay(500);
     ESP.restart();
   }
+
+  initDisplay();
 
   // Init GSM UART
   SerialAT.begin(115200, SERIAL_8N1, GSM_RX, GSM_TX);  // NEW: A7672S pins
@@ -4074,6 +4463,8 @@ void loop() {
     previousMillisss = millis();
     requestProcessed = false;
   }
+
+  updateDisplayState();
 
   // Reset button in loop (existing — GPIO 25)
   if (digitalRead(resetbutton) == LOW) {
