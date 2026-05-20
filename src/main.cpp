@@ -173,8 +173,8 @@ struct DisplaySensorData {
 DisplayState currentDisplayState = LOGO_PAGE;
 DisplaySensorData displaySensorData = {0.0f, 0.0f, 0.0f, false};
 unsigned long displayStateChangeTime = 0;
-const unsigned long LOGO_DURATION = 2000;
-const unsigned long SENSOR_DURATION = 12000;
+const unsigned long LOGO_DURATION = 3000;
+const unsigned long SENSOR_DURATION = 5000;
 bool displayReady = false;
 bool displayPageNeedsRedraw = true;
 int bottleAnimFrame = 0;
@@ -405,15 +405,12 @@ void updateDisplaySensorValue(uint8_t slaveId, uint16_t address, float value) {
   if (address == 3037) {
     displaySensorData.frequency = value;
     displaySensorData.dataValid = true;
-    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
   } else if (address == 3027) {
     displaySensorData.vlnAvg = value;
     displaySensorData.dataValid = true;
-    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
   } else if (address == 3023) {
     displaySensorData.vllAvg = value;
     displaySensorData.dataValid = true;
-    displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
   }
 }
 
@@ -451,7 +448,6 @@ void readDisplaySensors() {
     updateDisplaySensorValue(slaveId, 3023, combineToFloat(regs[0], regs[1]));
   }
 
-  displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
   requestInProgress = false;
 }
 
@@ -648,6 +644,15 @@ void displaySensorPage() {
   drawConveyor();
 }
 
+void drawCurrentDisplayPage() {
+  if (currentDisplayState == LOGO_PAGE) {
+    displayLogoPage();
+  } else {
+    displaySensorPage();
+    bottleAnimFrame = 0;
+  }
+}
+
 void updateDisplayState() {
   if (!displayReady) return;
 
@@ -664,28 +669,8 @@ void updateDisplayState() {
   }
 
   if (displayPageNeedsRedraw) {
-    if (currentDisplayState == LOGO_PAGE) {
-      displayLogoPage();
-    } else {
-      displaySensorPage();
-      bottleAnimFrame = 0;
-    }
+    drawCurrentDisplayPage();
     displayPageNeedsRedraw = false;
-  } else if (currentDisplayState == SENSOR_PAGE) {
-    static unsigned long lastAnimTime = 0;
-    static unsigned long lastDisplayReadTime = 0;
-
-    if (millis() - lastDisplayReadTime >= 1000) {
-      lastDisplayReadTime = millis();
-      readDisplaySensors();
-    }
-
-    if (millis() - lastAnimTime > 150) {
-      lastAnimTime = millis();
-      bottleAnimFrame++;
-      if (bottleAnimFrame > 340) bottleAnimFrame = 0;
-      drawConveyor();
-    }
   }
 }
 
