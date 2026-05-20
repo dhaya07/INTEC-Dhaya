@@ -426,20 +426,32 @@ void readDisplaySensors() {
 
   requestInProgress = true;
 
+  // Default to zero for every fresh display read cycle.
+  // Successful Modbus reads below will overwrite these values.
+  displaySensorData.frequency = 0.0f;
+  displaySensorData.vlnAvg = 0.0f;
+  displaySensorData.vllAvg = 0.0f;
+  displaySensorData.dataValid = false;
+
   if (readModbusRTUDirect(slaveId, 3, 3037, 2, regs, bools)) {
     updateDisplaySensorValue(slaveId, 3037, combineToFloat(regs[0], regs[1]));
   }
   delay(50);
 
+  regs[0] = 0;
+  regs[1] = 0;
   if (readModbusRTUDirect(slaveId, 3, 3027, 2, regs, bools)) {
     updateDisplaySensorValue(slaveId, 3027, combineToFloat(regs[0], regs[1]));
   }
   delay(50);
 
+  regs[0] = 0;
+  regs[1] = 0;
   if (readModbusRTUDirect(slaveId, 3, 3023, 2, regs, bools)) {
     updateDisplaySensorValue(slaveId, 3023, combineToFloat(regs[0], regs[1]));
   }
 
+  displayPageNeedsRedraw = (currentDisplayState == SENSOR_PAGE);
   requestInProgress = false;
 }
 
