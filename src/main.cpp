@@ -291,6 +291,9 @@ long intervalss = 100;
 int modbusIndex = 0;
 String splitmqttaddwrite[50];
 String splitmqttaddread[50];
+String stitchedModbusValues[50];
+bool stitchedModbusValueValid[50];
+bool stitchedModbusHasData = false;
 RTC_DATA_ATTR bool skipConfigResetAfterClear = false;
 bool ignoreConfigResetUntilRelease = false;
 
@@ -347,6 +350,9 @@ void readprocessModbusRequestTCPWiFi(const IPAddress& slaveIP, uint16_t function
 void readprocessModbusRequestTCPEthernet(const IPAddress& slaveIP, uint16_t functionCode, uint16_t address, uint16_t count, const String& dataType, const char* mqttTopic);
 void publishGroupedDeviceData();
 void storeGroupedValue(uint8_t deviceId, uint16_t address, float value);
+void resetStitchedModbusValues();
+void collectStitchedModbusValue(int index, const char* value);
+void publishStitchedModbusValues();
 uint16_t modbusRTUCRC(uint8_t* buf, uint8_t len);
 bool readModbusRTUDirect(uint8_t slaveId, uint8_t fc, uint16_t addr, uint16_t count, uint16_t* regs, bool* bools);
 bool writeModbusRTUDirect(uint8_t slaveId, uint8_t fc, uint16_t addr, uint16_t* regs, uint8_t regCount, bool boolVal);
@@ -1730,27 +1736,36 @@ int checkButton() {
 // Publish MQTT message via the active connection method (WiFi/GSM/Ethernet)
 void publishMessage(const char* mqttTopic, const char* msg, int qos) {
   if (strcmp(mqttMethod, "gsm") == 0) {
-    if (gsmMQTTConnected) {
-      sendMQTTViaGSM(mqttTopic, msg);
-    } else {
+    if (!gsmMQTTConnected) {
       Serial.println("GSM MQTT not connected. Reconnecting...");
       reconnect();
     }
+    if (gsmMQTTConnected) {
+      sendMQTTViaGSM(mqttTopic, msg);
+    } else {
+      Serial.println("GSM MQTT publish skipped: reconnect failed.");
+    }
   } else if (strcmp(mqttMethod, "wifi") == 0) {
+    if (!wifiClientPubSub.connected()) {
+      Serial.println("Wi-Fi MQTT not connected. Reconnecting...");
+      reconnect();
+    }
     if (wifiClientPubSub.connected()) {
       wifiClientPubSub.publish(mqttTopic, msg, strlen(msg), false, qos);
       Serial.println("Sending via Wi-Fi");
     } else {
-      Serial.println("Wi-Fi MQTT not connected. Reconnecting...");
-      reconnect();
+      Serial.println("Wi-Fi MQTT publish skipped: reconnect failed.");
     }
   } else if (strcmp(mqttMethod, "ethernet") == 0) {
+    if (!ethernetClientPubSub.connected()) {
+      Serial.println("Ethernet MQTT not connected. Reconnecting...");
+      reconnect();
+    }
     if (ethernetClientPubSub.connected()) {
       ethernetClientPubSub.publish(mqttTopic, msg, strlen(msg), false, qos);
       Serial.println("Sending via Ethernet");
     } else {
-      Serial.println("Ethernet MQTT not connected. Reconnecting...");
-      reconnect();
+      Serial.println("Ethernet MQTT publish skipped: reconnect failed.");
     }
   } else {
     Serial.println("Unknown MQTT method.");
@@ -1961,7 +1976,7 @@ void connectMQTTGSM() {
     if (res.indexOf("0,0") != -1) {
         Serial.println("[GSM-MQTT] Connected to broker!");
         gsmMQTTConnected = true;
-        sendMQTTViaGSM("bit/values", "hi from here");
+        sendMQTTViaGSM("INTEC/EM", "hi from here");
         resetBackoffDelay();
     } else {
         Serial.println("[GSM-MQTT] Connection failed (19=Network/Reject). Cleaning up...");
@@ -3605,6 +3620,67 @@ void storeGroupedValue(uint8_t deviceId, uint16_t address, float value) {
     deviceRegisterValues.size(), deviceId, deviceRegisterValues[deviceId].size());
 }
 
+void resetStitchedModbusValues() {
+  for (int i = 0; i < 50; i++) {
+    stitchedModbusValues[i] = "";
+    stitchedModbusValueValid[i] = false;
+  }
+  stitchedModbusHasData = false;
+}
+
+String getConfiguredCombinedPublishTopic() {
+  int maxTopics = (count < 50) ? count : 50;
+  for (int i = 0; i < maxTopics; i++) {
+    if (splitmqttaddread[i].length() > 0) {
+      return splitmqttaddread[i];
+    }
+  }
+
+  for (int i = 0; i < maxTopics; i++) {
+    String splitread[6];
+    splitString(substringsREAD[i], ',', splitread);
+    splitread[5].trim();
+    if (splitread[5].length() > 0) {
+      return splitread[5];
+    }
+  }
+
+  return "";
+}
+
+void collectStitchedModbusValue(int index, const char* value) {
+  if (index < 0 || index >= 50 || value == nullptr) return;
+
+  stitchedModbusValues[index] = String(value);
+  stitchedModbusValueValid[index] = true;
+  stitchedModbusHasData = true;
+}
+
+void publishStitchedModbusValues() {
+  String payload = "";
+  bool firstValue = true;
+  int maxValues = (count < 50) ? count : 50;
+
+  for (int i = 0; i < maxValues; i++) {
+    if (!firstValue) payload += ",";
+    payload += stitchedModbusValueValid[i] ? stitchedModbusValues[i] : "0.00";
+    firstValue = false;
+  }
+
+  if (payload.length() == 0) payload = "0.00";
+
+  String topic = getConfiguredCombinedPublishTopic();
+  if (topic.length() == 0) {
+    Serial.println("[MODBUS-STITCHED] Publish skipped: no MQTT topic configured in slave READ config");
+    resetStitchedModbusValues();
+    return;
+  }
+
+  publishMessage(topic.c_str(), payload.c_str(), 0);
+  Serial.printf("[MODBUS-STITCHED] Published to %s: %s\n", topic.c_str(), payload.c_str());
+  resetStitchedModbusValues();
+}
+
 // Publish all grouped device data as concatenated string values
 // Format: address1:value1,address2:value2,address3:value3,...
 // Topic format: baseTopicPath/deviceId
@@ -3753,7 +3829,7 @@ void readprocessModbusRequest(uint8_t slaveId, uint16_t functionCode, uint16_t a
   if (dataType == "float" && count == 2) {
     float v = combineToFloat(buffers[0], buffers[1]);
     updateDisplaySensorValue(slaveId, address, v);
-    snprintf(msg, sizeof(msg), "%f", v);
+    snprintf(msg, sizeof(msg), "%.2f", v);
   }
   else if (dataType == "int16" && count == 1) { snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]); }
   else if (dataType == "uint16" && count == 1) { snprintf(msg, sizeof(msg), "%u", buffers[0]); }
@@ -3767,10 +3843,6 @@ void readprocessModbusRequest(uint8_t slaveId, uint16_t functionCode, uint16_t a
     snprintf(msg, sizeof(msg), "%s", asciiString.c_str());
   } else { snprintf(msg, sizeof(msg), "Unsupported data type"); }
 
-  int qos = 0;
-  int payloadLength = strlen(msg);
- 
-
   if (callbackResult) {
     processNotificationWithWait(mqttTopic, msg, dataType);
     processStorageWithWait(mqttTopic, msg, dataType);
@@ -3782,17 +3854,7 @@ void readprocessModbusRequest(uint8_t slaveId, uint16_t functionCode, uint16_t a
       storeGroupedValue(slaveId, address, floatVal);
     }
 
-    if (strcmp(mqttMethod, "gsm") == 0) {
-        if (gsmMQTTConnected) {
-            sendMQTTViaGSM(mqttTopic, msg);
-        } else reconnect();
-    } else if (strcmp(mqttMethod, "wifi") == 0) {
-      if (wifiClientPubSub.connected()) wifiClientPubSub.publish(mqttTopic, msg, payloadLength, false, qos);
-      else reconnect();
-    } else if (strcmp(mqttMethod, "ethernet") == 0) {
-      if (ethernetClientPubSub.connected()) ethernetClientPubSub.publish(mqttTopic, msg, payloadLength, false, qos);
-      else reconnect();
-    }
+    collectStitchedModbusValue(modbusIndex, msg);
   }
 
   delete[] buffers; delete[] bufferbool;
@@ -3835,7 +3897,7 @@ void readprocessModbusRequestTCPWiFi(const IPAddress& slaveIP, uint16_t function
   if (dataType == "float" && count == 2) {
     float v = combineToFloat(buffers[0], buffers[1]);
     updateDisplaySensorValue(0, address, v);
-    snprintf(msg, sizeof(msg), "%f", v);
+    snprintf(msg, sizeof(msg), "%.2f", v);
   }
   else if (dataType == "int16" && count == 1) snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]);
   else if (dataType == "uint16" && count == 1) snprintf(msg, sizeof(msg), "%u", buffers[0]);
@@ -3852,7 +3914,10 @@ void readprocessModbusRequestTCPWiFi(const IPAddress& slaveIP, uint16_t function
   }
 
   if (callbackResult) {
-    publishMessage(mqttTopic, msg, 0);
+    processNotificationWithWait(mqttTopic, msg, dataType);
+    processStorageWithWait(mqttTopic, msg, dataType);
+    topicValueMap[mqttTopic] = msg;
+    collectStitchedModbusValue(modbusIndex, msg);
     if (String(mqttTopic).endsWith("/str")) lastPublishTimes[mqttTopic] = currentMillis;
   }
 
@@ -3897,7 +3962,7 @@ void readprocessModbusRequestTCPEthernet(const IPAddress& slaveIP, uint16_t func
   if (dataType == "float" && count == 2) {
     float v = combineToFloat(buffers[0], buffers[1]);
     updateDisplaySensorValue(0, address, v);
-    snprintf(msg, sizeof(msg), "%f", v);
+    snprintf(msg, sizeof(msg), "%.2f", v);
   }
   else if (dataType == "int16" && count == 1) snprintf(msg, sizeof(msg), "%d", (int16_t)buffers[0]);
   else if (dataType == "uint16" && count == 1) snprintf(msg, sizeof(msg), "%u", buffers[0]);
@@ -3916,7 +3981,10 @@ void readprocessModbusRequestTCPEthernet(const IPAddress& slaveIP, uint16_t func
   }
 
   if (callbackResult) {
-    publishMessage(mqttTopic, msg, 0);
+    processNotificationWithWait(mqttTopic, msg, dataType);
+    processStorageWithWait(mqttTopic, msg, dataType);
+    topicValueMap[mqttTopic] = msg;
+    collectStitchedModbusValue(modbusIndex, msg);
   }
 
   delete[] buffers; delete[] bufferbool;
@@ -4261,7 +4329,7 @@ void setup() {
       reconnect();
       // Send "hello from board" to MQTT immediately after connect
       delay(500);
-      sendMQTTViaGSM("bit/values", "{\"msg\":\"hello from board\"}");
+      sendMQTTViaGSM("INTEC/EM", "{\"msg\":\"hello from board\"}");
       Serial.println("[GSM] Hello message sent to MQTT!");
     } else {
       Serial.println("Failed to initialize GSM.");
@@ -4427,6 +4495,11 @@ void loop() {
         // Skip if slave ID is empty or 0
         if (splitread[0] == "" || splitread[0] == "0") {
           modbusIndex++;
+          if (modbusIndex >= count) {
+            publishStitchedModbusValues();
+            modbusIndex = 0;
+            Serial.printf("[MODBUS] Cycle complete. Free heap: %u\n", ESP.getFreeHeap());
+          }
         } else {
           Serial.printf("[MODBUS] Requesting idx=%d/%d slave=%s fc=%s addr=%s count=%s type=%s\n",
             modbusIndex, count, splitread[0].c_str(), splitread[1].c_str(), splitread[2].c_str(),
@@ -4445,8 +4518,14 @@ void loop() {
                                                 splitread[3].toInt(), splitread[4], splitread[5].c_str());
           }
           modbusIndex++;
+          if (modbusIndex >= count) {
+            publishStitchedModbusValues();
+            modbusIndex = 0;
+            Serial.printf("[MODBUS] Cycle complete. Free heap: %u\n", ESP.getFreeHeap());
+          }
         }
       } else {
+        publishStitchedModbusValues();
         modbusIndex = 0;
         Serial.printf("[MODBUS] Cycle complete. Free heap: %u\n", ESP.getFreeHeap());
       }
